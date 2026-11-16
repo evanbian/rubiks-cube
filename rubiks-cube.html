@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rubik's Cube</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#1a1a2e;font-family:'Segoe UI',Arial,sans-serif}
+  #ui{position:fixed;top:16px;left:16px;color:#eee;z-index:10;user-select:none}
+  #ui h1{margin:0 0 8px;font-size:20px;letter-spacing:1px}
+  #ui p{margin:2px 0;font-size:12px;color:#aaa}
+  #btns{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);display:flex;gap:10px;z-index:10}
+  button{padding:10px 18px;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;
+         background:#4f6ef7;color:#fff;transition:transform .1s, background .2s}
+  button:hover{background:#6a85ff;transform:translateY(-1px)}
+  button:disabled{opacity:.5;cursor:default;transform:none}
+  #status{position:fixed;top:16px;right:16px;color:#8fd18f;font-size:14px;z-index:10}
+</style>
+</head>
+<body>
+<div id="ui">
+  <h1>RUBIK'S CUBE</h1>
+  <p>Left-drag on cube face: rotate that layer</p>
+  <p>Left-drag on background: orbit view</p>
+  <p>Scroll: zoom</p>
+</div>
+<div id="status"></div>
+<div id="btns">
+  <button id="scramble">Scramble</button>
+  <button id="solve">Solve</button>
+  <button id="reset">Reset</button>
+</div>
+<script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
+<script src="https://unpkg.com/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+const COLORS = {U:0xffffff, D:0xffd500, F:0x009b48, B:0x0046ad, R:0xb90000, L:0xff5800};
+const size = 1, gap = 0.06;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.1, 100);
+camera.position.set(5,5,7);
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(devicePixelRatio);
+document.body.appendChild(renderer.domElement);
+scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+const dl = new THREE.DirectionalLight(0xffffff, 0.9); dl.position.set(6,10,8); scene.add(dl);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.enablePan = false;
+controls.minDistance = 5; controls.maxDistance = 20;
+
+// build cubies
+const cubeGroup = new THREE.Group();
+scene.add(cubeGroup);
+const cubies = [];
+const stickerMats = {};
+for (const f in COLORS) stickerMats[f] = new THREE.MeshStandardMaterial({color:COLORS[f], roughness:0.35});
+const innerMat = new THREE.MeshStandardMaterial({color:0x111111, roughness:0.9});
+
+function faceNormal(dir){
+  return {U:[0,1,0],D:[0,-1,0],F:[0,0,1],B:[0,0,-1],R:[1,0,0],L:[-1,0,0]}[dir];
+}
+function stickerMesh(dir){
+  const g = new THREE.PlaneGeometry(size*0.85, size*0.85);
+  const m = new THREE.Mesh(g, stickerMats[dir]);
+  const n = faceNormal(dir);
+  m.position.set(n[0]*size/2*1.001, n[1]*size/2*1.001, n[2]*size/2*1.001);
+  if (dir==='U') m.rotation.x = -Math.PI/2;
+  if (dir==='D') m.rotation.x = Math.PI/2;
+  if (dir==='F') {} 
+  if (dir==='B') m.rotation.y = Math.PI;
+  if (dir==='R') m.rotation.y = Math.PI/2;
+  if (dir==='L') m.rotation.y = -Math.PI/2;
+  return m;
+}
+const o = size+gap;
+for (let x=-1;x<=1;x++) for (let y=-1;y<=1;y++) for (let z=-1;z<=1;z++){
+  if (!x&&!y&&!z) continue;
+  const box = new THREE.Mesh(new THREE.BoxGeometry(size,size,size), innerMat);
+  box.position.set(x*o, y*o, z*o);
+  if (y===1) box.add(stickerMesh('U'));
+  if (y===-1) box.add(stickerMesh('D'));
+  if (z===1) box.add(stickerMesh('F'));
+  if (z===-1) box.add(stickerMesh('B'));
+  if (x===1) box.add(stickerMesh('R'));
+  if (x===-1) box.add(stickerMesh('L'));
+  box.userData.cubelet = {x,y,z};
+  cubeGroup.add(box);
+  cubies.push(box);
+}
+
+// layer rotation logic
+let animating = false;
+const moves = {
+  U:{axis:'y',layer:1,dir:1}, D:{axis:'y',layer:-1,dir:-1},
+  R:{axis:'x',layer:1,dir:1}, L:{axis:'x',layer:-1,dir:-1},
+  F:{axis:'z',layer:1,dir:1}, B:{axis:'z',layer:-1,dir:-1},
+  Ui:{axis:'y',layer:1,dir:-1}, Di:{axis:'y',layer:-1,dir:1},
+  Ri:{axis:'x',layer:1,dir:-1}, Li:{axis:'x',layer:-1,dir:1},
+  Fi:{axis:'z',layer:1,dir:-1}, Bi:{axis:'z',layer:-1,dir:1}
+};
+function applyMove(name, duration=250){
+  return new Promise(res=>{
+    const mv = moves[name];
+    const group = cubies.filter(c=>Math.round(c.position[mv.axis]/o)===mv.layer);
+    const pivot = new THREE.Group();
+    cubeGroup.add(pivot);
+    group.forEach(c=>pivot.attach(c));
+    const target = mv.dir * Math.PI/2;
+    const start = performance.now();
+    // setTimeout-based tick: requestAnimationFrame never fires in hidden tabs,
+    // which would leave the animation (and the whole app) permanently stuck.
+    function tick(){
+      const now = performance.now();
+      const t = Math.min((now-start)/duration,1);
+      const e = 1-Math.pow(1-t,3);
+      pivot.rotation[mv.axis] = target*e;
+      if (t<1) setTimeout(tick, 16);
+      else {
+        pivot.rotation[mv.axis] = target;
+        pivot.updateMatrixWorld(true);
+        group.forEach(c=>{ cubeGroup.attach(c); snap(c); });
+        cubeGroup.remove(pivot);
+        res();
+      }
+    }
+    tick();
+  });
+}
+function snap(c){
+  ['position','rotation'].forEach(()=>{
+    c.position.set(Math.round(c.position.x/o)*o, Math.round(c.position.y/o)*o, Math.round(c.position.z/o)*o);
+  });
+  // snap rotation to multiples of PI/2
+  ['x','y','z'].forEach(a=>{
+    c.rotation[a] = Math.round(c.rotation[a]/(Math.PI/2))*(Math.PI/2);
+  });
+}
+
+async function scramble(){
+  if (animating) return; animating = true; setButtons(false); setStatus('Scrambling...');
+  const names = ['U','D','R','L','F','B'];
+  let last = '';
+  for (let i=0;i<25;i++){
+    let n = names[Math.floor(Math.random()*6)];
+    while (n===last) n = names[Math.floor(Math.random()*6)];
+    last = n;
+    if (Math.random()<0.5) n += 'i';
+    recordMove(n);
+    await applyMove(n, 130);
+  }
+  animating = false; setButtons(true); setStatus('Scrambled — try solving!');
+}
+function resetCube(){
+  if (animating) return;
+  cubies.forEach((c,i)=>{
+    const d = c.userData.cubelet;
+    c.position.set(d.x*o, d.y*o, d.z*o);
+    c.rotation.set(0,0,0);
+  });
+  setStatus('Reset to solved state');
+}
+async function solveCube(){
+  if (animating) return;
+  // record inverse of user/scramble moves -> simplest approach: reverse move history
+  if (!history.length){ setStatus('Already solved'); return; }
+  animating = true; setButtons(false); setStatus('Solving...');
+  const seq = history.slice().reverse();
+  history = [];
+  for (const m of seq){ await applyMove(invert(m), 150); }
+  animating = false; setButtons(true); setStatus('Solved!');
+}
+function invert(m){ return m.endsWith('i') ? m[0] : m+'i'; }
+
+let history = [];
+function recordMove(m){ history.push(m); if (history.length>5000) history.shift(); }
+
+// mouse layer-drag detection
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+let dragStart = null; // {point, normal, cubie}
+function getStickerHit(e){
+  const rect = renderer.domElement.getBoundingClientRect();
+  ndc.x = ((e.clientX-rect.left)/rect.width)*2-1;
+  ndc.y = -((e.clientY-rect.top)/rect.height)*2+1;
+  raycaster.setFromCamera(ndc, camera);
+  const hits = raycaster.intersectObjects(cubeGroup.children, true);
+  for (const h of hits){
+    if (h.object.geometry instanceof THREE.PlaneGeometry){
+      // find parent cubie
+      let p = h.object;
+      while (p && !p.userData.cubelet) p = p.parent;
+      return {cubie:p, normal:h.face.normal.clone().transformDirection(h.object.matrixWorld).round(),
+              point:h.point.clone()};
+    }
+  }
+  return null;
+}
+renderer.domElement.addEventListener('pointerdown', e=>{
+  if (animating || e.button!==0) return;
+  const hit = getStickerHit(e);
+  if (hit){
+    hit.screenX0 = e.clientX;
+    hit.screenY0 = e.clientY;
+    dragStart = hit;
+    controls.enabled = false;
+  }
+});
+renderer.domElement.addEventListener('pointerup', async e=>{
+  if (!dragStart) return;
+  const dx = e.clientX - dragStart.screenX0;
+  const dy = e.clientY - dragStart.screenY0;
+  const start = dragStart; dragStart = null; controls.enabled = true;
+  if (Math.hypot(dx,dy) < 12) return; // just a click
+  // decide rotation: project world drag direction onto screen
+  const n = start.normal;
+  // candidate axes: the two axes perpendicular to the face normal
+  const axes = ['x','y','z'].filter(a=>Math.abs(n[a])<0.5);
+  let best = null;
+  for (const a of axes){
+    // tangential direction for rotating around axis a at the hit point
+    const tmp = new THREE.Vector3(); const tmp2 = new THREE.Vector3();
+    const rot = new THREE.Matrix4().makeRotationAxis(new THREE.Vector3(a==='x'?1:0,a==='y'?1:0,a==='z'?1:0), 0.1);
+    tmp.copy(start.point).applyMatrix4(rot).sub(start.point); // world motion for +rot
+    // project to screen
+    const p0 = start.point.clone().project(camera);
+    const p1 = tmp.add(start.point).project(camera);
+    const sx = (p1.x-p0.x)*rectW()/2, sy = -(p1.y-p0.y)*rectH()/2;
+    const dot = dx*sx + dy*sy;
+    const mag = Math.hypot(sx,sy)*Math.hypot(dx,dy);
+    if (mag>0){
+      const score = dot/mag;
+      if (!best || Math.abs(score)>Math.abs(best.score)) best = {axis:a, score};
+    }
+  }
+  if (!best) return;
+  const mv = movesForAxis(best.axis, n, best.score>0 ? 1 : -1, start.cubie);
+  if (!mv) return;
+  animating = true; setButtons(false);
+  await applyMove(mv);
+  recordMove(mv);
+  if (isSolved()) { setStatus('Solved! 🎉'); history = []; }
+  else setStatus('Moves: '+history.length);
+  animating = false; setButtons(true);
+});
+function rectW(){ return renderer.domElement.clientWidth; }
+function rectH(){ return renderer.domElement.clientHeight; }
+function movesForAxis(axis, normal, sign, cubie){
+  // layer coordinate along axis
+  const layer = Math.round(cubie.position[axis]/o);
+  // map (axis, layer, rotation direction) to move names
+  // rotation around axis with dir rotates points; determine face letter
+  const key = axis + layer;
+  const map = {
+    'y1': sign>0?'U':'Ui', 'y-1': sign>0?'Di':'D', 'y0': sign>0?'E':'Ei',
+    'x1': sign>0?'R':'Ri', 'x-1': sign>0?'Li':'L', 'x0': sign>0?'M':'Mi',
+    'z1': sign>0?'F':'Fi', 'z-1': sign>0?'Bi':'B', 'z0': sign>0?'S':'Si'
+  };
+  const name = map[axis+layer];
+  if (!name) return null;
+  if (['E','Ei','M','Mi','S','Si'].includes(name)) return null; // skip slice moves for history simplicity
+  return name;
+}
+function isSolved(){
+  // check each sticker's world normal color group consistency
+  const groups = {};
+  for (const c of cubies){
+    c.updateMatrixWorld(true);
+    for (const st of c.children){
+      if (!(st.geometry instanceof THREE.PlaneGeometry)) continue;
+      const n = new THREE.Vector3(0,0,1).transformDirection(st.matrixWorld).round();
+      const key = n.x+','+n.y+','+n.z;
+      const col = st.material.color.getHexString();
+      if (groups[key] && groups[key]!==col) return false;
+      groups[key] = col;
+    }
+  }
+  return true;
+}
+
+// buttons
+const btns = {scramble:document.getElementById('scramble'), solve:document.getElementById('solve'), reset:document.getElementById('reset')};
+btns.scramble.onclick = async ()=>{ await scramble(); setStatus('Scrambled — try solving!'); };
+btns.solve.onclick = solveCube;
+btns.reset.onclick = ()=>{ resetCube(); history=[]; };
+function setButtons(on){ Object.values(btns).forEach(b=>b.disabled=!on); }
+function setStatus(s){ document.getElementById('status').textContent = s; }
+setStatus('Ready');
+
+addEventListener('resize', ()=>{
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+(function loop(){ requestAnimationFrame(loop); controls.update(); renderer.render(scene,camera); })();
+</script>
+</body>
+</html>
